@@ -9,44 +9,64 @@ Endpoints:
   GET  /api/signals       — last scan results for all watchlist symbols
   GET  /api/account       — equity, cash, daily P&L
   POST /api/chat          — AI chatbot (natural language trade commands)
-  POST /api/predict       — LLM stock direction prediction
+  GET  /api/predict/:sym  — LLM stock direction prediction
 """
 
 import logging
 import threading
 
 from flask import Flask, jsonify, request
-from flask_cors import CORS
+
+# flask-cors is optional — CORS headers added manually if not installed
+try:
+    from flask_cors import CORS
+    _has_cors = True
+except ImportError:
+    _has_cors = False
 
 import config
-import llm_analyst
-from bot import TradingBot
 
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)   # allow dashboard UI on any origin
+if _has_cors:
+    CORS(app)
 
-_bot: TradingBot | None = None
-_bot_status = {"running": False, "error": None}
-_chat_history: list[dict] = []
+
+# Manual CORS fallback so the UI always works even without flask-cors
+@app.after_request
+def _cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return response
+
+
+@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def _preflight(path):
+    return jsonify({}), 200
 
 
 # ── Bot thread ────────────────────────────────────────────────────────────────
 
+_bot = None           # TradingBot instance, set once thread starts
+_bot_running = False
+_bot_error: str | None = None
+_chat_history: list[dict] = []
+
+
 def _run_bot():
-    global _bot
+    global _bot, _bot_running, _bot_error
     try:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s  %(levelname)-7s  %(message)s",
-        )
+        # Lazy import — keeps module-level imports minimal so Flask always starts
+        from bot import TradingBot
         _bot = TradingBot()
-        _bot_status["running"] = True
+        _bot_running = True
         _bot.run()
     except Exception as e:
-        _bot_status["running"] = False
-        _bot_status["error"] = str(e)
+        _bot_running = False
+        _bot_error = str(e)
         logger.exception("Bot crashed: %s", e)
 
 
@@ -54,13 +74,13 @@ def _run_bot():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "bot_running": _bot_status["running"]}), 200
+    return jsonify({"status": "ok", "bot_running": _bot_running}), 200
 
 
 # ── Status ────────────────────────────────────────────────────────────────────
 
-@app.route("/api/status")
 @app.route("/")
+@app.route("/api/status")
 def status():
     acct: dict = {}
     if _bot:
@@ -76,14 +96,14 @@ def status():
             pass
 
     return jsonify({
-        "bot_running": _bot_status["running"],
+        "bot_running": _bot_running,
         "bot_paused": _bot._paused if _bot else False,
         "paper_trading": config.ALPACA_PAPER,
         "max_positions": config.MAX_POSITIONS,
         "watchlist_size": len(config.WATCHLIST),
         "llm_enabled": bool(config.ANTHROPIC_API_KEY),
         "short_selling": config.SHORT_SELLING_ENABLED,
-        "error": _bot_status.get("error"),
+        "error": _bot_error,
         **acct,
     })
 
@@ -112,11 +132,12 @@ def positions():
                 "trailing_stop": st.get("trailing_stop"),
                 "take_profit": st.get("take_profit"),
                 "half_sold": st.get("half_sold", False),
-                "days_held": st.get("entry_date"),
+                "entry_date": st.get("entry_date"),
                 "atr": st.get("atr"),
             })
         return jsonify(result)
     except Exception as e:
+        logger.error("Positions: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -144,6 +165,7 @@ def trades():
                 pass
         return jsonify(result)
     except Exception as e:
+        logger.error("Trades: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -153,8 +175,7 @@ def trades():
 def signals():
     if not _bot:
         return jsonify([])
-    data = _bot._last_signals
-    # Enrich with RS scores
+    data = list(_bot._last_signals)
     for item in data:
         item["rs_score"] = round(_bot._last_rs_scores.get(item["symbol"], 0), 2)
     return jsonify(data)
@@ -165,19 +186,21 @@ def signals():
 @app.route("/api/account")
 def account():
     if not _bot:
-        return jsonify({"error": "bot not running"}), 503
+        return jsonify({"error": "bot not running yet"}), 503
     try:
         a = _bot.trade_client.get_account()
+        last_eq = float(a.last_equity)
+        eq = float(a.equity)
         return jsonify({
-            "equity": float(a.equity),
+            "equity": eq,
             "cash": float(a.cash),
             "buying_power": float(a.buying_power),
             "portfolio_value": float(a.portfolio_value),
-            "daily_pnl": round(float(a.equity) - float(a.last_equity), 2),
-            "daily_pnl_pct": round((float(a.equity) - float(a.last_equity)) / float(a.last_equity) * 100, 2)
-                             if float(a.last_equity) > 0 else 0,
+            "daily_pnl": round(eq - last_eq, 2),
+            "daily_pnl_pct": round((eq - last_eq) / last_eq * 100, 2) if last_eq else 0,
         })
     except Exception as e:
+        logger.error("Account: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -187,19 +210,20 @@ def account():
 def chat():
     global _chat_history
     if not config.ANTHROPIC_API_KEY:
-        return jsonify({"error": "ANTHROPIC_API_KEY not configured"}), 503
+        return jsonify({"error": "ANTHROPIC_API_KEY not set in environment"}), 503
     if not _bot:
-        return jsonify({"error": "bot not running"}), 503
+        return jsonify({"error": "bot not running yet"}), 503
 
     data = request.get_json(silent=True) or {}
     message = str(data.get("message", "")).strip()
     if not message:
-        return jsonify({"error": "message required"}), 400
+        return jsonify({"error": "message field required"}), 400
 
     try:
+        import llm_analyst  # lazy — anthropic pkg may not be installed
         reply, _chat_history = llm_analyst.chat(
             message=message,
-            history=_chat_history[-30:],   # keep last 30 turns
+            history=_chat_history[-30:],
             tool_executor=_bot.tool_executor,
         )
         return jsonify({"reply": reply, "history_length": len(_chat_history)})
@@ -215,23 +239,25 @@ def chat_clear():
     return jsonify({"cleared": True})
 
 
-# ── LLM stock prediction ──────────────────────────────────────────────────────
+# ── LLM prediction ────────────────────────────────────────────────────────────
 
 @app.route("/api/predict/<symbol>")
 def predict(symbol: str):
     if not config.ANTHROPIC_API_KEY:
-        return jsonify({"error": "ANTHROPIC_API_KEY not configured"}), 503
+        return jsonify({"error": "ANTHROPIC_API_KEY not set in environment"}), 503
     if not _bot:
-        return jsonify({"error": "bot not running"}), 503
+        return jsonify({"error": "bot not running yet"}), 503
 
     symbol = symbol.upper()
     try:
-        import history_analyzer
+        import llm_analyst       # lazy import
+        import history_analyzer  # lazy import
+        from strategy import add_indicators
+
         df = _bot._single_bars(symbol)
         if df.empty:
             return jsonify({"error": f"No data for {symbol}"}), 404
 
-        from strategy import add_indicators
         df_ind = add_indicators(df)
         if df_ind.empty:
             return jsonify({"error": "Could not compute indicators"}), 500
@@ -261,5 +287,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=_run_bot, daemon=True, name="trading-bot")
     t.start()
     port = config.HEALTH_PORT
-    logger.info("API server on port %d", port)
+    logger.info("API server listening on port %d", port)
     app.run(host="0.0.0.0", port=port, debug=False)
