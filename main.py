@@ -148,18 +148,27 @@ def trades():
     if not _bot:
         return jsonify([])
     try:
-        activities = _bot.trade_client.get_activities()
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=50)
+        orders = _bot.trade_client.get_orders(filter=req)
         result = []
-        for a in list(activities)[:50]:
+        for o in orders:
             try:
+                # Only show filled orders (actual trades)
+                if str(o.status) not in ("OrderStatus.FILLED", "filled"):
+                    continue
+                filled_qty = float(o.filled_qty or o.qty or 0)
+                filled_price = float(o.filled_avg_price or 0)
                 result.append({
-                    "id": str(a.id),
-                    "symbol": a.symbol,
-                    "side": str(a.side),
-                    "qty": float(a.qty),
-                    "price": float(a.price),
-                    "total": round(float(a.qty) * float(a.price), 2),
-                    "timestamp": str(a.transaction_time),
+                    "id": str(o.id),
+                    "symbol": o.symbol,
+                    "side": str(o.side).replace("OrderSide.", "").lower(),
+                    "qty": filled_qty,
+                    "price": filled_price,
+                    "total": round(filled_qty * filled_price, 2),
+                    "timestamp": str(o.filled_at or o.submitted_at),
                 })
             except Exception:
                 pass
