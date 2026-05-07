@@ -281,6 +281,101 @@ def predict(symbol: str):
         return jsonify({"error": str(e)}), 500
 
 
+# ── Debug — shows why the bot is/isn't trading ───────────────────────────────
+
+@app.route("/api/debug")
+def debug():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import strategy
+
+    ET = ZoneInfo("America/New_York")
+    now = datetime.now(ET)
+    h, m = now.hour, now.minute
+    minutes = h * 60 + m
+    time_ok = (600 <= minutes <= 720) or (840 <= minutes <= 900)  # 10-12 or 14-15
+
+    market_open = False
+    bullish = None
+    if _bot:
+        try:
+            market_open = _bot.trade_client.get_clock().is_open
+        except Exception:
+            pass
+        try:
+            spy_df = _bot._single_bars("SPY", limit=220)
+            bullish = strategy.market_is_bullish(spy_df)
+        except Exception:
+            pass
+
+    return jsonify({
+        "server_time_et": now.strftime("%Y-%m-%d %H:%M:%S ET"),
+        "market_open": market_open,
+        "time_filter_ok": time_ok,
+        "time_filter_enabled": config.TIME_FILTER_ENABLED,
+        "market_bullish": bullish,
+        "regime_filter_enabled": config.MARKET_REGIME_ENABLED,
+        "intraday_confirm_enabled": config.INTRADAY_CONFIRM_ENABLED,
+        "bot_paused": _bot._paused if _bot else None,
+        "open_positions": len(_bot._get_open_symbols()) if _bot else 0,
+        "last_signals_count": len(_bot._last_signals) if _bot else 0,
+        "hint": (
+            "Market closed — bot will trade when US market opens (9:30-16:00 ET)"
+            if not market_open else
+            "Time filter blocking — only trades 10:00-12:00 and 14:00-15:00 ET"
+            if config.TIME_FILTER_ENABLED and not time_ok else
+            "Bear market filter — no longs until SPY > 200 EMA"
+            if bullish is False else
+            "Bot is active and scanning for signals"
+        ),
+    })
+
+
+# ── Test trade — buy 1 share of SPY then immediately sell it ─────────────────
+
+@app.route("/api/test-trade", methods=["POST"])
+def test_trade():
+    """
+    Executes a real paper-trade round-trip (buy 1 SPY → sell 1 SPY).
+    Use this to confirm Alpaca connectivity and order execution work.
+    Only works while the market is open.
+    """
+    if not _bot:
+        return jsonify({"error": "bot not running yet"}), 503
+
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+
+    results = {}
+    symbol = request.get_json(silent=True, force=True) or {}
+    sym = str(symbol.get("symbol", "SPY")).upper()
+
+    try:
+        # BUY
+        buy_order = _bot.trade_client.submit_order(MarketOrderRequest(
+            symbol=sym, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+        ))
+        results["buy_order_id"] = str(buy_order.id)
+        results["buy_status"] = str(buy_order.status)
+        logger.info("TEST BUY  %s qty=1 order=%s", sym, buy_order.id)
+
+        # SELL immediately
+        sell_order = _bot.trade_client.submit_order(MarketOrderRequest(
+            symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+        ))
+        results["sell_order_id"] = str(sell_order.id)
+        results["sell_status"] = str(sell_order.status)
+        logger.info("TEST SELL %s qty=1 order=%s", sym, sell_order.id)
+
+        results["success"] = True
+        results["message"] = f"Test round-trip on {sym} submitted — check your Alpaca paper account"
+        return jsonify(results)
+
+    except Exception as e:
+        logger.error("Test trade failed: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
