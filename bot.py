@@ -549,8 +549,9 @@ class TradingBot:
         if not self._paused:
             if bullish:
                 # P2: rank by relative strength, take top RS_TOP_N
-                self._last_rs_scores = ranker.all_scores(bars, spy_df or pd.DataFrame())
-                ranked = ranker.rank(bars, spy_df or pd.DataFrame())
+                spy_df_safe = spy_df if spy_df is not None else pd.DataFrame()
+                self._last_rs_scores = ranker.all_scores(bars, spy_df_safe)
+                ranked = ranker.rank(bars, spy_df_safe)
                 self._scan_entries(open_symbols, equity, bars, ranked)
             else:
                 logger.warning("BEAR market — scanning shorts only")
