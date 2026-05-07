@@ -94,6 +94,34 @@ def update_trailing_stop(
     return max(current_stop, candidate)   # never move stop down
 
 
+def update_short_trailing_stop(
+    entry_price: float,
+    current_price: float,
+    current_stop: float,
+    atr: float,
+) -> float:
+    """
+    Ratchet the stop down for a SHORT position as price falls in our favour.
+    Never moves the stop up (which would widen risk).
+
+    Levels:
+      profit >= 1.0x ATR → move stop to breakeven
+      profit >= 1.5x ATR → move stop to entry - 0.5x ATR (lock partial gain)
+    """
+    if not config.TRAILING_STOP_ENABLED or atr <= 0:
+        return current_stop
+
+    profit = entry_price - current_price   # profit = drop for shorts
+    candidate = current_stop
+
+    if profit >= config.TRAILING_LOCK_ATR * atr:
+        candidate = round(entry_price - 0.5 * atr, 4)
+    elif profit >= config.TRAILING_BREAKEVEN_ATR * atr:
+        candidate = round(entry_price, 4)
+
+    return min(current_stop, candidate)    # never move short stop up
+
+
 def portfolio_heat(positions: list[dict], equity: float) -> float:
     """Fraction of equity currently at risk across all open positions."""
     total_risk = sum(
