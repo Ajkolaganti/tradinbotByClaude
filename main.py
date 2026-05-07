@@ -293,7 +293,7 @@ def debug():
     now = datetime.now(ET)
     h, m = now.hour, now.minute
     minutes = h * 60 + m
-    time_ok = (600 <= minutes <= 720) or (840 <= minutes <= 900)  # 10-12 or 14-15
+    time_ok = (600 <= minutes <= 930)  # 10:00-15:30 ET
 
     market_open = False
     bullish = None
@@ -336,9 +336,11 @@ def debug():
 @app.route("/api/test-trade", methods=["POST"])
 def test_trade():
     """
-    Executes a real paper-trade round-trip (buy 1 SPY → sell 1 SPY).
-    Use this to confirm Alpaca connectivity and order execution work.
-    Only works while the market is open.
+    Submits a paper BUY of 1 share to confirm Alpaca connectivity.
+    Does NOT immediately sell — Alpaca blocks same-day buy+sell of the
+    same symbol with no existing position (wash-trade rule).
+    Check your Alpaca paper account to confirm the order, then use
+    POST /api/test-trade/close to sell it.
     """
     if not _bot:
         return jsonify({"error": "bot not running yet"}), 503
@@ -346,33 +348,56 @@ def test_trade():
     from alpaca.trading.requests import MarketOrderRequest
     from alpaca.trading.enums import OrderSide, TimeInForce
 
-    results = {}
-    symbol = request.get_json(silent=True, force=True) or {}
-    sym = str(symbol.get("symbol", "SPY")).upper()
+    data = request.get_json(silent=True, force=True) or {}
+    sym = str(data.get("symbol", "SPY")).upper()
 
     try:
-        # BUY
-        buy_order = _bot.trade_client.submit_order(MarketOrderRequest(
+        order = _bot.trade_client.submit_order(MarketOrderRequest(
             symbol=sym, qty=1, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
         ))
-        results["buy_order_id"] = str(buy_order.id)
-        results["buy_status"] = str(buy_order.status)
-        logger.info("TEST BUY  %s qty=1 order=%s", sym, buy_order.id)
-
-        # SELL immediately
-        sell_order = _bot.trade_client.submit_order(MarketOrderRequest(
-            symbol=sym, qty=1, side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
-        ))
-        results["sell_order_id"] = str(sell_order.id)
-        results["sell_status"] = str(sell_order.status)
-        logger.info("TEST SELL %s qty=1 order=%s", sym, sell_order.id)
-
-        results["success"] = True
-        results["message"] = f"Test round-trip on {sym} submitted — check your Alpaca paper account"
-        return jsonify(results)
-
+        logger.info("TEST BUY %s qty=1 order=%s status=%s", sym, order.id, order.status)
+        return jsonify({
+            "success": True,
+            "symbol": sym,
+            "order_id": str(order.id),
+            "status": str(order.status),
+            "message": f"BUY 1 {sym} submitted to Alpaca paper account. "
+                       f"Call POST /api/test-trade/close to sell it.",
+        })
     except Exception as e:
-        logger.error("Test trade failed: %s", e)
+        logger.error("Test buy failed: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/test-trade/close", methods=["POST"])
+def test_trade_close():
+    """Sell the test position opened by /api/test-trade."""
+    if not _bot:
+        return jsonify({"error": "bot not running yet"}), 503
+
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+
+    data = request.get_json(silent=True, force=True) or {}
+    sym = str(data.get("symbol", "SPY")).upper()
+
+    try:
+        qty = _bot._get_position_qty(sym)
+        if qty == 0:
+            return jsonify({"error": f"No open position in {sym}"}), 400
+        order = _bot.trade_client.submit_order(MarketOrderRequest(
+            symbol=sym, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+        ))
+        logger.info("TEST SELL %s qty=%d order=%s", sym, qty, order.id)
+        return jsonify({
+            "success": True,
+            "symbol": sym,
+            "qty_sold": qty,
+            "order_id": str(order.id),
+            "status": str(order.status),
+        })
+    except Exception as e:
+        logger.error("Test close failed: %s", e)
         return jsonify({"success": False, "error": str(e)}), 500
 
 

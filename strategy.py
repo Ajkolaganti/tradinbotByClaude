@@ -129,17 +129,17 @@ def market_is_bullish(spy_df: pd.DataFrame | None) -> bool:
 # ── Time-of-day filter (P4) ───────────────────────────────────────────────────
 
 def is_valid_trading_time() -> bool:
-    """Only trade 10:00-12:00 and 14:00-15:00 ET — highest quality setups."""
+    """
+    Allow trades from 10:00 AM to 3:30 PM ET.
+    Skips the first 30 min (volatile open) and last 30 min (illiquid close).
+    """
     if not config.TIME_FILTER_ENABLED:
         return True
     now = datetime.now(ET)
-    h, m = now.hour, now.minute
-    minutes = h * 60 + m
-    window1 = (10 * 60, 12 * 60)
-    window2 = (14 * 60, 15 * 60)
-    ok = window1[0] <= minutes <= window1[1] or window2[0] <= minutes <= window2[1]
+    minutes = now.hour * 60 + now.minute
+    ok = (10 * 60) <= minutes <= (15 * 60 + 30)
     if not ok:
-        logger.debug("Time filter: %02d:%02d ET — outside trading windows", h, m)
+        logger.debug("Time filter: %02d:%02d ET outside 10:00-15:30 window", now.hour, now.minute)
     return ok
 
 
